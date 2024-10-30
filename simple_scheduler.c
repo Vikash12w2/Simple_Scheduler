@@ -94,18 +94,73 @@ bool isPresent(ReadyQueue *q, int pid) {
     return false; // not found
 }
 
+void handle_new_process(ReadyQueue *q) {
+    int fd = open("pid_processes", O_RDONLY);
+    if (fd == -1) {
+        if (errno == ENOENT) {
+            // File doesn't exist yet, that's okay
+            return;
+        }
+        perror("Error opening process_pids file");
+        return;
+    }
+
+    int pid_process;
+    ssize_t read_result;
+
+    // Read all PIDs from the file
+    while ((read_result = read(fd, &pid_process, sizeof(int))) > 0) {
+        Process new_process;
+        new_process.pid = pid_process;
+        new_process.ExecutionTime = 0;
+        new_process.WaitTime = 0;
+        
+        if (!isPresent(q, pid_process)) {
+            enqueue(q, new_process);
+            printf("Added process PID %d to queue\n", pid_process);
+        }
+    }
+
+    close(fd);
+
+    // Clear the file after reading
+    int fd_clear = open("pid_processes", O_WRONLY | O_TRUNC);
+    if (fd_clear != -1) {
+        close(fd_clear);
+    }
+}
+
 int main(int argc, char *argv[]){
+    int fd1 = open("system_parameter", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd1 == -1) {
+        perror("Error creating system_parameter file");
+        exit(1);
+    }
 
     int pid_scheduler = getpid();
-    int fd1 = open("system_parameter", O_WRONLY);
-    write(fd1, &pid_scheduler, sizeof(int));
+    if (write(fd1, &pid_scheduler, sizeof(int)) == -1) {
+        perror("Error writing scheduler PID");
+        close(fd1);
+        exit(1);
+    }
     close(fd1);
 
+    printf("Scheduler started with PID: %d\n", pid_scheduler);
+    
+    // Create the process_pids file
+    int fd_pids = open("pid_processes", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_pids == -1) {
+        perror("Error creating process_pids file");
+        exit(1);
+    }
+    close(fd_pids);
 
 
-    ReadyQueue q;
 
-    initializeQueue(&q);
+    ReadyQueue ready_queue;
+    ReadyQueue completed_queue;
+    initializeQueue(&ready_queue);
+    initializeQueue(&completed_queue);
 
     int fd3 = open("system_parameter", O_RDONLY);
     int NCPU, TSLICE;
@@ -120,107 +175,75 @@ int main(int argc, char *argv[]){
     }
 
     while(1){
-        int pid_process;
         int fd2 = open("pid_processes", O_RDONLY);
         
-        if (fd2 == -1){
-            printf("Error while oprning file descriptor ---> scheduler\n");
-            exit(0);
-        }
-
-        if (read(fd2, &pid_process, sizeof(int)) == -1)
-        {
-            printf("Error while reading pocesse pids ---> scheduler\n");
-            exit(0);
-        }
-
-        Process pro1;
-        pro1.pid = pid_process;
-        pro1.ExecutionTime = 0;
-        pro1.WaitTime = 0;
-        enqueue(&q, pro1);
-
+        if (fd2 != -1) {
+            pid_t new_pid;
+            while (read(fd2, &new_pid, sizeof(pid_t)) > 0) {
+                Process new_proc = {
+                    .pid = new_pid,
+                    .ExecutionTime = 0,
+                    .WaitTime = 0
+                };
+                if (!isPresent(&ready_queue, new_pid)) {
+                    enqueue(&ready_queue, new_proc);
+                    printf("Added process %d to ready queue\n", new_pid);
+                }
+            }
         close(fd2);
-        close(fd[0]);
-        write(fd[1],&pro1,sizeof(Process));
-        close(fd[1]);
-        kill(pid_scheduler, SIGSTOP);
-    }
 
-    int pid = fork();
-    if (pid == -1){
-        perror("Could not fork\n");
-    }
+        truncate("process_pids", 0);
+        }
 
-    if(pid==0){
-        ReadyQueue RunQueue;
-        ReadyQueue CompletedQueue;
-
-        while(!isEmpty(&q)){
-            Process pro2;
-            read(fd[0],&pro2,sizeof(Process));
-            if(!isPresent(&q,pro2.pid)){
-                enqueue(&q,pro2);
-            }
-            for(int i = 0; i <= NCPU; i++){
-                Process pro3;
-                pro3=dequeue(&q);
-                kill(pro3.pid,SIGCONT);
-                enqueue(&RunQueue,pro3);
-            }
-
-            usleep(TSLICE*1000);
-
-            for(int i=NCPU+1;i<=q.rear;i++){
-                Process pro4;
-                pro4.WaitTime += TSLICE;
-            }
-
-            for(int i=0; i <= NCPU; i++){
-                Process pro5;
-                pro5=dequeue(&RunQueue);
-                kill(pro5.pid,SIGSTOP);
-                enqueue(&RunQueue,pro5);
-            }
-
-            //Update process info
-            for(int j = 0; j <= NCPU; j++){
+     // Schedule processes
+        int running_count = 0;
+        while (!isEmpty(&ready_queue) && running_count < NCPU) {
+            Process proc = dequeue(&ready_queue);
+            
+            // Check if process still exists
+            if (kill(proc.pid, 0) == 0) {
+                kill(proc.pid, SIGCONT);
+                proc.ExecutionTime += TSLICE;
+                running_count++;
+                
+                // Wait for time slice
+                usleep(TSLICE * 1000);
+                
+                // Stop process and check status
+                kill(proc.pid, SIGSTOP);
+                
                 int status;
-                Process process;
-                process=dequeue(&RunQueue);
-                int result = waitpid(process.pid, &status, 0);
-
-                if(WIFEXITED(status)){
-                    process.ExecutionTime += TSLICE;
-                    enqueue(&CompletedQueue,process);
-                }
-                else{
-                    process.ExecutionTime += TSLICE;
-                    enqueue(&q,process);
+                pid_t result = waitpid(proc.pid, &status, WNOHANG);
+                
+                if (result == 0) {
+                    // Process still running
+                    enqueue(&ready_queue, proc);
+                } else if (result > 0 && WIFEXITED(status)) {
+                    // Process completed
+                    enqueue(&completed_queue, proc);
                 }
             }
         }
-
-        int fd = open("final_information",O_WRONLY);
-        if(fd == -1){
-            printf("Error while opening file descriptor\n");
-            exit(0);
+        
+        // Update wait times for processes in ready queue
+        if (!isEmpty(&ready_queue)) {
+            for (int i = ready_queue.front; i <= ready_queue.rear; i++) {
+                ready_queue.comands[i].WaitTime += TSLICE;
+            }
         }
-
-        int b = CompletedQueue.rear + 1;
-        if(write(fd, &b, sizeof(int)) == -1){
-            printf("Error while writing in the file\n");
-            exit(0);
+        
+        // Write completed process information
+        int fd_info = open("final_information", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_info != -1) {
+            int size = completed_queue.rear - completed_queue.front + 1;
+            write(fd_info, &size, sizeof(int));
+            write(fd_info, &completed_queue, sizeof(ReadyQueue));
+            close(fd_info);
         }
-
-        if(write(fd, &CompletedQueue, sizeof(ReadyQueue)) == -1){
-            printf("Error while writing final_information\n");
-            exit(0);
-        }
-
-        close(fd);
-    }
-    else{
-        wait(NULL);
-    }
+        
+        // Small sleep to prevent CPU hogging
+        usleep(1000);
+    }   
+    
+    return 0;
 }
