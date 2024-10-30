@@ -41,6 +41,28 @@ typedef struct {
 command_info command_history[MAX_INPUT_SIZE];
 int history_index = 0;
 
+void initialize_files() {
+    // Wait for system_parameter file to be created by scheduler
+    int max_retries = 5;
+    int retries = 0;
+    int fd;
+    
+    while (retries < max_retries) {
+        fd = open("system_parameter", O_RDONLY);
+        if (fd != -1) {
+            close(fd);
+            break;
+        }
+        sleep(1);
+        retries++;
+    }
+    
+    if (retries == max_retries) {
+        printf("Error: Scheduler not running. Please start the scheduler first.\n");
+        exit(1);
+    }
+}
+
 void shell(){
     printf("\033[H\033[J");
     printf("SIMPLE SHELL\n");
@@ -112,8 +134,6 @@ void exec_args(char** parsed) {
             break;
 
         case 0:
-            // Waiting for signal for execution
-            pause();
             if (execvp(parsed[0], parsed) < 0) {
                 perror("execvp");
                 exit(EXIT_FAILURE);
@@ -292,35 +312,44 @@ int command_handler(char** parsed) {
                 printf("Execution Time: %.6f seconds\n", command_history[i].duration);
             }
 
-            int fd = open("final_information",O_RDONLY);
-            if(fd == -1){
-                printf("Error while opening file descriptor\n");
-                exit(0);
-            }
+            if (access("final_information", F_OK) != -1) {
+        int fd = open("final_information", O_RDONLY);
+        if (fd == -1) {
+            perror("Error while opening final_information");
+        }
+            else{
             int size;
             ReadyQueue queue;
-            if(read(fd,&size,sizeof(int)) == -1){
-                printf("Error while reading the ready queue\n");
-                exit(0);
-            }
-            if(read(fd,&queue,size)){
-                printf("Error while reading the ready queue\n");
-                exit(0);
+            ssize_t read_size = read(fd, &size, sizeof(int));
+            if (read_size == -1) {
+                perror("Error while reading queue size");
+            } else if (read_size == 0) {
+                printf("No scheduled processes information available\n");
+            } else {
+                // Initialize queue
+                queue.front = 0;
+                queue.rear = size - 1;
+                
+                if (read(fd, &queue, sizeof(ReadyQueue)) != -1) {
+                    printf("\nScheduled processes information:\n");
+                    for (int i = 0; i < size && !isEmpty(&queue); i++) {
+                        Process process = dequeue(&queue);
+                        printf("\nPID: %d\n", process.pid);
+                        printf("Execution time: %d ms\n", process.ExecutionTime);
+                        printf("Wait time: %d ms\n", process.WaitTime);
+                    }
+                } else {
+                    perror("Error while reading queue data");
+                }
             }
             close(fd);
+        }
+    } else {
+        printf("\nNo scheduling information available yet\n");
+    }
 
-            printf("\n\nscheduled processes information : \n\n");
-            for(int i=0;i<size;i++){
-                printf("\n");
-                Process process;
-                process=dequeue(&queue);
-                printf("PID : %d\n",process.pid);
-                printf("Execution_time : %d\n",process.ExecutionTime);
-                printf("Wait_time : %d\n",process.WaitTime);
-            }
-
-            printf("\nShell Closed\n");
-            exit(0);
+    printf("\nShell Closed\n");
+    exit(0);
             
         default:
             break;
@@ -412,8 +441,11 @@ void runInBackground(char* comand) {
         freopen("/dev/null", "w", stderr);
 
         // Execute the program
-        if (execlp(comand, comand, NULL) == -1) {
-            perror("execlp");
+        char *args[2];
+        args[0] = comand;
+        args[1] = NULL;
+        if (execvp(comand, args) == -1) {
+            perror("execvp");
             exit(EXIT_FAILURE);
         }
 
@@ -421,19 +453,34 @@ void runInBackground(char* comand) {
     }
     else{
         kill(status,SIGSTOP);
-        kill(pid_scheduler,SIGCONT);
-        int fd = open("process_pids",O_WRONLY);
-        if(write(fd,&status,sizeof(int)) == -1){
-            printf("Error while writing!!\n");
-            exit(0);
+        int fd = open("pid_processes", O_WRONLY | O_APPEND);
+        if (fd == -1) {
+            // If file doesn't exist, create it
+            fd = open("pid_processes", O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd == -1) {
+                perror("Error opening process_pids file");
+                exit(1);
+            }
+        }
+        ssize_t write_result = write(fd, &status, sizeof(int));
+        if (write_result == -1) {
+            perror("Error writing to process_pids file");
+            close(fd);
+            exit(1);
         }
         close(fd);
-        wait(NULL);
+
+        if (kill(pid_scheduler, SIGCONT) == -1) {
+            perror("Error signaling scheduler");
+        }
+        
+        printf("Process %d submitted for scheduling\n", status);
     }
 }
 
 
 int main(){
+    initialize_files();
     char string[MAX_INPUT_SIZE];
     char *parsed_args[MAX_INPUT_SIZE];
     char*parsed_piped_args[MAX_INPUT_SIZE];
@@ -447,23 +494,26 @@ int main(){
     printf("Enter the time quantum(in milliseconds) permitted to execute on a core: ");
     scanf("%d",&TSLICE);
 
-    int fd1 = open("system_parameter",O_RDONLY);
+    int fd1 = open("system_parameter",O_RDWR);
     if(fd1 == -1){
         printf("Error while reading system parameter\n");
         exit(0);
     }
-    read(fd1,&pid_scheduler,sizeof(int));
-    printf("pid_scheduler %d\n",pid_scheduler);
-    close(fd1);
-
-    int fd2 = open("system_parameter",O_WRONLY);
-    if(fd2 == -1){
-        printf("Error while writing system parameter\n");
-        exit(0);
+    if (read(fd1, &pid_scheduler, sizeof(int)) == -1) {
+        perror("Error reading scheduler PID");
+        close(fd1);
+        exit(1);
     }
-    write(fd2,&NCPU,sizeof(int));
-    write(fd2,&TSLICE,sizeof(int));
-    close(fd2);
+    printf("pid_scheduler %d\n",pid_scheduler);
+
+    
+    if (write(fd1, &NCPU, sizeof(int)) == -1 || write(fd1, &TSLICE, sizeof(int)) == -1) {
+        perror("Error writing parameters");
+        close(fd1);
+        exit(1);
+    }
+    close(fd1);
+     printf("Successfully initialized. Scheduler PID: %d\n", pid_scheduler);
 
     do{
         getcwd(a,sizeof(a));
