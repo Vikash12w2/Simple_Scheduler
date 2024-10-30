@@ -50,28 +50,6 @@ void handle_signal(int signum) {
     exit(EXIT_SUCCESS);  // Exit the shell
 }
 
-// Prompt the user for input
-//void prompt_user_input(char *input) {
-  //  printf("SimpleShell$ ");  // Display custom shell prompt
-  //  if (fgets(input, MAX_CMD_LEN, stdin) != NULL) {
-    //    // Remove the trailing newline character safely
-    //    input[strcspn(input, "\n")] = '\0';  
-   // }
-//}
-
-//// Execute a command (piped or simple)
-//void execute_command(char *input) {
-  //  if (input == NULL || input[0] == '\0') {
-    //    return;  // Do nothing if the input is empty
-   /// }
-
-    //// Check if the command contains a pipe symbol
-   // if (strstr(input, "|")) {
-     //   execute_piped_commands(input);
-   // } else {
-     //   parse_and_execute(input);
-    //}
-//}
 
 // Main function with user interaction loop
 int main() {
