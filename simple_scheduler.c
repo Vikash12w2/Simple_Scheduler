@@ -1,249 +1,192 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <time.h>
-#include <sys/time.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <unistd.h> 
+#include <unistd.h>
 #include <sys/wait.h>
+#include <signal.h>
+#include <sys/types.h>
 
-
+// process in the ready queue
 typedef struct{
-    int pid;
+    pid_t pid;
     int ExecutionTime;
     int WaitTime;
-}Process;
+    int priority;
+    struct Process* next;
+} Process;
 
-#define MAX_QUEUE_SIZE 1000
 
-typedef struct {
-    Process comands[MAX_QUEUE_SIZE];
-    int front, rear;
-} ReadyQueue;
 
-//to initialize a queue
-void initializeQueue(ReadyQueue *q)
-{
-    q->front = -1;
-    q->rear = -1;
+// Global variables
+Process *ReadyQueue = NULL, *last_process = NULL;
+int num_cpus, time_slice, running_count = 0;
+pid_t running_processes[200];
+
+// Helper function to get PID of a process (currently returns current process PID)
+pid_t get_pid_process(Process *p) {
+    return p->pid;
 }
 
-bool isEmpty(ReadyQueue *q){
-    bool a = q->front == -1;
-    return a;
+// Updates the last process pointer in the ready queue
+void update_last_process() {
+    last_process = ReadyQueue;
+    while (last_process && last_process->next != NULL) {
+        last_process = last_process->next;
+    }
 }
 
-bool isFull(ReadyQueue *q){
-    bool a = (q->rear + 1) % MAX_QUEUE_SIZE == q->front;
-    return a;
-}
-
-//to enqueue an element
-void enqueue(ReadyQueue *q,Process com){
-    if (isFull(q)){
-        printf("Queue is full.\n");
-        return;
-    }
-    if (isEmpty(q)){
-        q->front = 0;
-        q->rear = 0;
-    }
-    else{
-        q->rear = (q->rear + 1) % MAX_QUEUE_SIZE;
-    }
-    q->comands[q->rear] = com;
-}
-
-Process dequeue(ReadyQueue *q)
-{
-    if (isEmpty(q))
-    {
-        printf("Ready Queue is empty\n");
-        exit(0);
-    }
-    Process com = q->comands[q->front];
-    if (q->front == q->rear){
-        q->front = -1;
-        q->rear = -1;
-    }
-    else{
-        q->front = (q->front + 1) % MAX_QUEUE_SIZE;
-    }
-    return com;
-}
-
-bool isPresent(ReadyQueue *q, int pid) {
-    if (isEmpty(q)) {
-        return false;
-    }
-
-    int a = q->front;
-
-    while (a <= q->rear) {
-        if (q->comands[a].pid == pid) {
-            return true; // found
+// Stops all running processes and resubmits them to the ready queue
+void stop_and_resubmit_running_processes() {
+    for (int i = 0; i < running_count; i++) {
+        if (kill(running_processes[i], SIGSTOP) == -1) {
+            perror("Error stopping process");
         }
-        a++;
+        submit_process(running_processes[i], 1);
     }
-
-    return false; // not found
+    running_count = 0;
 }
 
-void handle_new_process(ReadyQueue *q) {
-    int fd = open("pid_processes", O_RDONLY);
-    if (fd == -1) {
-        if (errno == ENOENT) {
-            // File doesn't exist yet, that's okay
-            return;
-        }
-        perror("Error opening process_pids file");
-        return;
-    }
-
-    int pid_process;
-    ssize_t read_result;
-
-    // Read all PIDs from the file
-    while ((read_result = read(fd, &pid_process, sizeof(int))) > 0) {
-        Process new_process;
-        new_process.pid = pid_process;
-        new_process.ExecutionTime = 0;
-        new_process.WaitTime = 0;
-        
-        if (!isPresent(q, pid_process)) {
-            enqueue(q, new_process);
-            printf("Added process PID %d to queue\n", pid_process);
-        }
-    }
-
-    close(fd);
-
-    // Clear the file after reading
-    int fd_clear = open("pid_processes", O_WRONLY | O_TRUNC);
-    if (fd_clear != -1) {
-        close(fd_clear);
-    }
+// Checks if the ready queue is empty
+int is_ReadyQueue_empty() {
+    return ReadyQueue == NULL;
 }
 
-int main(int argc, char *argv[]){
-    int fd1 = open("system_parameter", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd1 == -1) {
-        perror("Error creating system_parameter file");
-        exit(1);
-    }
+// Manages the ready queue: resumes processes or removes finished ones
+void manage_ReadyQueue() {
+    Process *current = ReadyQueue, *prev = NULL;
+    int active_count = 0;
 
-    int pid_scheduler = getpid();
-    if (write(fd1, &pid_scheduler, sizeof(int)) == -1) {
-        perror("Error writing scheduler PID");
-        close(fd1);
-        exit(1);
-    }
-    close(fd1);
+    while (current && active_count < num_cpus) {
+        int status;
+        int wait_res = waitpid(current->pid, &status, WNOHANG);
 
-    printf("Scheduler started with PID: %d\n", pid_scheduler);
-    
-    // Create the process_pids file
-    int fd_pids = open("pid_processes", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_pids == -1) {
-        perror("Error creating process_pids file");
-        exit(1);
-    }
-    close(fd_pids);
-
-
-
-    ReadyQueue ready_queue;
-    ReadyQueue completed_queue;
-    initializeQueue(&ready_queue);
-    initializeQueue(&completed_queue);
-
-    int fd3 = open("system_parameter", O_RDONLY);
-    int NCPU, TSLICE;
-    read(fd3, &NCPU, sizeof(int));
-    read(fd3, &TSLICE, sizeof(int));
-    close(fd3);
-
-    int fd[2];
-    if (pipe(fd)==-1){
-        printf("Pipe Failed\n");
-        exit(0);
-    }
-
-    while(1){
-        int fd2 = open("pid_processes", O_RDONLY);
-        
-        if (fd2 != -1) {
-            pid_t new_pid;
-            while (read(fd2, &new_pid, sizeof(pid_t)) > 0) {
-                Process new_proc = {
-                    .pid = new_pid,
-                    .ExecutionTime = 0,
-                    .WaitTime = 0
-                };
-                if (!isPresent(&ready_queue, new_pid)) {
-                    enqueue(&ready_queue, new_proc);
-                    printf("Added process %d to ready queue\n", new_pid);
-                }
+        if (wait_res == 0) {  // Process is still running
+            if (kill(current->pid, SIGCONT) == -1) {
+                perror("Error continuing process");
             }
-        close(fd2);
+            running_processes[running_count++] = current->pid;
 
-        truncate("process_pids", 0);
-        }
+            // Move the current process to the end of the ready queue based on priority
+            if (prev) {
+                prev->next = current->next;
+            } else {
+                ReadyQueue = current->next;
+            }
 
-     // Schedule processes
-        int running_count = 0;
-        while (!isEmpty(&ready_queue) && running_count < NCPU) {
-            Process proc = dequeue(&ready_queue);
-            
-            // Check if process still exists
-            if (kill(proc.pid, 0) == 0) {
-                kill(proc.pid, SIGCONT);
-                proc.ExecutionTime += TSLICE;
-                running_count++;
-                
-                // Wait for time slice
-                usleep(TSLICE * 1000);
-                
-                // Stop process and check status
-                kill(proc.pid, SIGSTOP);
-                
-                int status;
-                pid_t result = waitpid(proc.pid, &status, WNOHANG);
-                
-                if (result == 0) {
-                    // Process still running
-                    enqueue(&ready_queue, proc);
-                } else if (result > 0 && WIFEXITED(status)) {
-                    // Process completed
-                    enqueue(&completed_queue, proc);
-                }
+            Process* temp = current;
+            current = current->next;
+
+            temp->next = NULL;
+            if (last_process) {
+                last_process->next = temp;
+                last_process = temp;
+            } else {
+                ReadyQueue = last_process = temp;
             }
-        }
-        
-        // Update wait times for processes in ready queue
-        if (!isEmpty(&ready_queue)) {
-            for (int i = ready_queue.front; i <= ready_queue.rear; i++) {
-                ready_queue.comands[i].WaitTime += TSLICE;
+            active_count++;
+        } else if (wait_res > 0) {  // Process finished
+            if (prev) {
+                prev->next = current->next;
+            } else {
+                ReadyQueue = current->next;
             }
+            free(current);
+            current = (prev) ? prev->next : ReadyQueue;
+        } else {
+            perror("waitpid error");
+            current = current->next;
         }
-        
-        // Write completed process information
-        int fd_info = open("final_information", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd_info != -1) {
-            int size = completed_queue.rear - completed_queue.front + 1;
-            write(fd_info, &size, sizeof(int));
-            write(fd_info, &completed_queue, sizeof(ReadyQueue));
-            close(fd_info);
+    }
+}
+
+
+// Simulates handling connections and sets up the round-robin scheduler
+void handle_connect() {
+    sigset_t mask, old_mask;
+    sigfillset(&mask);
+
+    sigprocmask(SIG_BLOCK, &mask, &old_mask);
+    signal(SIGALRM, round_robin_alarm_handler);
+    alarm(time_slice);
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+    sleep(20);  // Placeholder sleep
+}
+
+// Round-robin alarm handler to manage process scheduling
+void round_robin_alarm_handler(int signum) {
+    printf("Received SIGALRM\n");
+    sigset_t mask, prev_mask;
+    sigfillset(&mask);
+
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+    stop_and_resubmit_running_processes();
+    manage_ReadyQueue();
+    alarm(time_slice);
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+}
+
+// Initializes the scheduler with the number of CPUs and time slice
+void initialise_scheduler(int input_num_cpus, int input_time_slice) {
+    num_cpus = input_num_cpus;
+    time_slice = input_time_slice;
+    signal(SIGALRM, round_robin_alarm_handler);
+    alarm(time_slice);
+}
+
+// Creates a new process structure
+Process* create_new_process(pid_t pid, int priority) {
+    Process* new_process = (Process*)malloc(sizeof(Process));
+    if (!new_process) {
+        perror("Failed to initialize new process");
+        exit(EXIT_FAILURE);
+    }
+    new_process->pid = pid;
+    new_process->priority = priority;
+    new_process->next = NULL;
+    return new_process;
+}
+
+// Submits a process to the scheduler
+void submit_process(pid_t pid, int priority) {
+    Process* new_process = create_new_process(pid, priority);
+    if (!ReadyQueue || new_process->priority < ReadyQueue->priority) {
+        // Insert at the start if it has higher priority
+        new_process->next = ReadyQueue;
+        ReadyQueue = new_process;
+    } else {
+        // Find the correct position for insertion based on priority
+        Process* current = ReadyQueue;
+        while (current->next && current->next->priority <= new_process->priority) {
+            current = current->next;
         }
-        
-        // Small sleep to prevent CPU hogging
-        usleep(1000);
-    }   
-    
-    return 0;
+        new_process->next = current->next;
+        current->next = new_process;
+    }
+    if (!new_process->next) {
+        last_process = new_process;
+    }
+}
+
+
+// Stops all processes and frees memory
+void stop_scheduler() {
+    sigset_t mask, prev_mask;
+    sigfillset(&mask);
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+
+    while (ReadyQueue) {
+        Process *current = ReadyQueue;
+        if (waitpid(current->pid, NULL, WNOHANG) == 0) {
+            if (kill(current->pid, SIGCONT) == -1) {
+                perror("Error continuing process");
+            }
+            waitpid(current->pid, NULL, 0);
+        } else {
+            perror("waitpid error in stop_scheduler");
+        }
+        ReadyQueue = current->next;
+        free(current);
+    }
+
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
 }
